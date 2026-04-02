@@ -9,6 +9,7 @@ SUCCESS='\033[38;5;150m'      # #B7CC85 verde
 ERROR='\033[38;5;174m'        # #CB7C94 rosa/rojo
 PURPLE='\033[38;5;183m'       # #C99AD6 púrpura
 CYAN='\033[38;5;116m'         # cyan suave
+ORANGE='\033[38;5;215m'       # naranja para output style
 BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
@@ -21,6 +22,19 @@ MODEL=$(echo "$input" | jq -r '.model.display_name // "Claude"')
 DIR=$(echo "$input" | jq -r '.workspace.current_dir // "~"')
 ADDED=$(echo "$input" | jq -r '.cost.total_lines_added // 0')
 REMOVED=$(echo "$input" | jq -r '.cost.total_lines_removed // 0')
+
+# Output style
+OUTPUT_STYLE=$(echo "$input" | jq -r '.output_style.name // empty')
+
+# Vim mode
+VIM_MODE=$(echo "$input" | jq -r '.vim.mode // empty')
+
+# Session name
+SESSION_NAME=$(echo "$input" | jq -r '.session_name // empty')
+
+# Worktree
+WORKTREE_NAME=$(echo "$input" | jq -r '.worktree.name // empty')
+WORKTREE_BRANCH=$(echo "$input" | jq -r '.worktree.branch // empty')
 
 # Cost tracking
 COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
@@ -35,6 +49,15 @@ SECS=$((DURATION_SEC % 60))
 # Token counts (cumulative session)
 TOTAL_IN=$(echo "$input" | jq -r '.context_window.total_input_tokens // 0')
 TOTAL_OUT=$(echo "$input" | jq -r '.context_window.total_output_tokens // 0')
+
+# Token speed (tokens/s based on API duration)
+API_DURATION_MS=$(echo "$input" | jq -r '.cost.total_api_duration_ms // 0')
+if [ "$API_DURATION_MS" -gt 0 ] 2>/dev/null; then
+  TOTAL_TOKENS=$((TOTAL_IN + TOTAL_OUT))
+  TOK_PER_SEC=$((TOTAL_TOKENS * 1000 / API_DURATION_MS))
+else
+  TOK_PER_SEC=0
+fi
 
 # Format token counts (k/M)
 format_tokens() {
@@ -68,10 +91,17 @@ DIR_NAME=$(basename "$DIR")
 # Git info (cached)
 GIT_CACHE="/tmp/claude_statusline_git"
 GIT_CACHE_TTL=5
+REMOTE_CACHE="/tmp/claude_statusline_remote"
+REMOTE_CACHE_TTL=60
 
 git_cache_stale() {
   [ ! -f "$GIT_CACHE" ] || \
   [ $(($(date +%s) - $(stat -f %m "$GIT_CACHE" 2>/dev/null || echo 0))) -gt $GIT_CACHE_TTL ]
+}
+
+remote_cache_stale() {
+  [ ! -f "$REMOTE_CACHE" ] || \
+  [ $(($(date +%s) - $(stat -f %m "$REMOTE_CACHE" 2>/dev/null || echo 0))) -gt $REMOTE_CACHE_TTL ]
 }
 
 if git_cache_stale; then
@@ -86,6 +116,16 @@ if git_cache_stale; then
 fi
 
 IFS='|' read -r BRANCH GIT_DIRTY < "$GIT_CACHE"
+
+# Git remote URL (cached longer — doesn't change often)
+GIT_REMOTE_URL=""
+if [ -n "$BRANCH" ]; then
+  if remote_cache_stale; then
+    REMOTE_RAW=$(git remote get-url origin 2>/dev/null | sed 's/git@github.com:/https:\/\/github.com\//' | sed 's/\.git$//')
+    echo "$REMOTE_RAW" > "$REMOTE_CACHE"
+  fi
+  GIT_REMOTE_URL=$(cat "$REMOTE_CACHE" 2>/dev/null)
+fi
 
 # Model icon
 MODEL_ICON="🤖"
@@ -137,27 +177,66 @@ format_reset() {
   fi
 }
 
-# === LINE 1: Model, dir, git, lines changed ===
+# === LINE 1: Model, dir, git (clickable), worktree, lines changed ===
 SEP="${MUTED}  ${NC}"
 
 LINE1="${BOLD}${PURPLE}${MODEL_ICON} ${MODEL}${NC}"
+
+# Output style (if set and not "default")
+if [ -n "$OUTPUT_STYLE" ] && [ "$OUTPUT_STYLE" != "default" ]; then
+  LINE1+=" ${ORANGE}${OUTPUT_STYLE}${NC}"
+fi
+
+# Vim mode
+if [ -n "$VIM_MODE" ]; then
+  if [ "$VIM_MODE" = "NORMAL" ]; then
+    LINE1+=" ${SUCCESS}N${NC}"
+  else
+    LINE1+=" ${CYAN}I${NC}"
+  fi
+fi
+
 LINE1+="${SEP}"
+
+# Session name or directory
+if [ -n "$SESSION_NAME" ]; then
+  LINE1+="${PRIMARY}⚡${SESSION_NAME}${NC}${SEP}"
+fi
+
 LINE1+="${ACCENT}󰉋 ${DIR_NAME}${NC}"
 
+# Git branch — clickable if remote URL available
 if [ -n "$BRANCH" ]; then
   LINE1+="${SEP}"
-  LINE1+="${SECONDARY} ${BRANCH}${GIT_DIRTY}${NC}"
+  if [ -n "$GIT_REMOTE_URL" ]; then
+    BRANCH_URL="${GIT_REMOTE_URL}/tree/${BRANCH}"
+    LINE1+="\033]8;;${BRANCH_URL}\a${SECONDARY} ${BRANCH}${GIT_DIRTY}\033]8;;\a${NC}"
+  else
+    LINE1+="${SECONDARY} ${BRANCH}${GIT_DIRTY}${NC}"
+  fi
+fi
+
+# Worktree indicator
+if [ -n "$WORKTREE_NAME" ]; then
+  LINE1+="${SEP}"
+  LINE1+="${CYAN}🌲${WORKTREE_NAME}${NC}"
 fi
 
 LINE1+="${SEP}"
 LINE1+="${SUCCESS}+${ADDED}${NC} ${ERROR}-${REMOVED}${NC}"
 
-# === LINE 2: Context bar, cost, tokens, rate limits ===
+# === LINE 2: Context bar, cost, tokens, speed, duration, rate limits ===
 LINE2="${MUTED}ctx${NC} ${BAR} ${MUTED}${CTX_PERCENT}%${NC}"
 LINE2+="${SEP}"
 LINE2+="${ACCENT}\$${COST_FMT}${NC}"
 LINE2+="${SEP}"
 LINE2+="${CYAN}↓${IN_FMT}${NC} ${PURPLE}↑${OUT_FMT}${NC}"
+
+# Token speed
+if [ "$TOK_PER_SEC" -gt 0 ]; then
+  LINE2+=" ${DIM}${MUTED}${TOK_PER_SEC}t/s${NC}"
+fi
+
 LINE2+="${SEP}"
 LINE2+="${MUTED}${MINS}m${SECS}s${NC}"
 
@@ -179,5 +258,5 @@ if [ -n "$RATE_7D" ]; then
   LINE2+=" ${MUTED}7d${NC} ${RATE_7D_COLOR}${RATE_7D_INT}%${NC}"
 fi
 
-echo -e "$LINE1"
-echo -e "$LINE2"
+printf '%b\n' "$LINE1"
+printf '%b\n' "$LINE2"
